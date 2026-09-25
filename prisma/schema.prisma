@@ -1,0 +1,315 @@
+// Diamond Dental Prisma Schema
+// Aligned with the E-commerce, Package & Inventory Management MVP Specification
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ==========================================
+// 1. Staff Authentication & Access
+// ==========================================
+
+enum Role {
+  ADMIN
+  CLERK
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         Role     @default(CLERK)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  passwordResetTokens   PasswordResetToken[]
+  inventoryTransactions InventoryTransaction[]
+  collectedPayments     Payment[]
+
+  @@map("users")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  token     String    @unique
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@map("password_reset_tokens")
+}
+
+// ==========================================
+// 2. Catalog & Categories
+// ==========================================
+
+model Category {
+  id          String    @id @default(cuid())
+  name        String    @unique
+  slug        String    @unique
+  description String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  packages Package[]
+  products Product[]
+
+  @@map("categories")
+}
+
+// ==========================================
+// 3. Inventory & Physical Components
+// ==========================================
+
+model InventoryItem {
+  id            String   @id @default(cuid())
+  sku           String?  @unique
+  name          String
+  description   String?
+  physicalStock Int      @default(0) // Physical units on shelf/storage
+  reserveStock  Int      @default(0) // Safety buffer reserved internally
+  isStandalone  Boolean  @default(false) // Sold as a standalone item vs. package component
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Link to standalone retail product (if sold individually)
+  product              Product?
+  packageItems         PackageItem[]
+  inventoryTransactions InventoryTransaction[]
+  reservationItems     ReservationItem[]
+
+  @@map("inventory_items")
+}
+
+// ==========================================
+// 4. Sellable Storefront Entities
+// ==========================================
+
+model Package {
+  id             String   @id @default(cuid())
+  name           String
+  slug           String   @unique
+  description    String?
+  price          Decimal  @db.Decimal(10, 2)
+  imageUrl       String?
+  isActive       Boolean  @default(true)
+  showExactStock Boolean  @default(false) // If true, shows e.g. "12 available"; if false, shows "Available"
+  assembledStock Int      @default(0) // Physically assembled units ready for immediate sale
+  categoryId     String
+  category       Category @relation(fields: [categoryId], references: [id])
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  items                 PackageItem[]
+  orderItems            OrderItem[]
+  reservationItems      ReservationItem[]
+  inventoryTransactions InventoryTransaction[]
+
+  @@map("packages")
+}
+
+model PackageItem {
+  id              String        @id @default(cuid())
+  packageId       String
+  package         Package       @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  inventoryItemId String
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  quantity        Int           @default(1) // Number of this component inside one package
+
+  @@unique([packageId, inventoryItemId])
+  @@map("package_items")
+}
+
+model Product {
+  id              String        @id @default(cuid())
+  name            String
+  slug            String        @unique
+  description     String?
+  price           Decimal       @db.Decimal(10, 2)
+  imageUrl        String?
+  isActive        Boolean       @default(true)
+  showExactStock  Boolean       @default(false)
+  categoryId      String
+  category        Category      @relation(fields: [categoryId], references: [id])
+  inventoryItemId String        @unique
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  orderItems OrderItem[]
+
+  @@map("products")
+}
+
+// ==========================================
+// 5. Orders & Stock Reservations
+// ==========================================
+
+enum OrderStatus {
+  ORDERED           // Newly placed by customer
+  CONFIRMED         // Clerk called customer and confirmed
+  PREPARING         // Order being physically gathered/packed
+  READY_FOR_PICKUP  // Ready at store for customer collection
+  PICKED_UP_UNPAID  // Package handed over, waiting for cashier payment
+  COMPLETED         // Payment received and order finalized
+  EXPIRED           // 7 days elapsed without collection; stock released
+  CANCELLED         // Manually cancelled by clerk/admin
+}
+
+model Order {
+  id            String      @id @default(cuid())
+  orderNumber   String      @unique // e.g. ORD-2026-00124
+  customerName  String
+  customerPhone String
+  customerEmail String
+  status        OrderStatus @default(ORDERED)
+  totalAmount   Decimal     @db.Decimal(10, 2)
+  currency      String      @default("ETB")
+  notes         String?
+
+  expiresAt   DateTime  // Expiration timestamp (created_at + 7 days)
+  confirmedAt DateTime?
+  preparedAt  DateTime?
+  readyAt     DateTime?
+  pickedUpAt  DateTime?
+  completedAt DateTime?
+  expiredAt   DateTime?
+  cancelledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items       OrderItem[]
+  reservation Reservation?
+  payment     Payment?
+
+  @@map("orders")
+}
+
+enum OrderItemType {
+  PACKAGE
+  STANDALONE_PRODUCT
+}
+
+model OrderItem {
+  id        String        @id @default(cuid())
+  orderId   String
+  order     Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  itemType  OrderItemType
+  packageId String?
+  package   Package?      @relation(fields: [packageId], references: [id])
+  productId String?
+  product   Product?      @relation(fields: [productId], references: [id])
+  name      String        // Historical snapshot of product/package name
+  unitPrice Decimal       @db.Decimal(10, 2) // Locked price at time of order
+  quantity  Int           @default(1)
+  subtotal  Decimal       @db.Decimal(10, 2)
+
+  @@map("order_items")
+}
+
+enum ReservationStatus {
+  ACTIVE
+  RELEASED
+  FULFILLED
+}
+
+model Reservation {
+  id        String            @id @default(cuid())
+  orderId   String            @unique
+  order     Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status    ReservationStatus @default(ACTIVE)
+  expiresAt DateTime
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  items ReservationItem[]
+
+  @@map("reservations")
+}
+
+model ReservationItem {
+  id              String         @id @default(cuid())
+  reservationId   String
+  reservation     Reservation    @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  packageId       String?
+  package         Package?       @relation(fields: [packageId], references: [id])
+  inventoryItemId String?
+  inventoryItem   InventoryItem? @relation(fields: [inventoryItemId], references: [id])
+  quantity        Int            @default(1)
+
+  @@map("reservation_items")
+}
+
+// ==========================================
+// 6. In-Store Payments
+// ==========================================
+
+enum PaymentStatus {
+  PENDING
+  PAID
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  OTHER
+}
+
+model Payment {
+  id            String        @id @default(cuid())
+  orderId       String        @unique
+  order         Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  amount        Decimal       @db.Decimal(10, 2)
+  currency      String        @default("ETB")
+  status        PaymentStatus @default(PENDING)
+  method        PaymentMethod @default(CASH)
+  reference     String?       // Optional receipt number or POS reference
+  collectedById String?
+  collectedBy   User?         @relation(fields: [collectedById], references: [id])
+  paidAt        DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@map("payments")
+}
+
+// ==========================================
+// 7. Inventory Transactions & Audit Log
+// ==========================================
+
+enum TransactionType {
+  PURCHASE_RESTOCK            // New inventory received from supplier
+  MANUAL_ADJUSTMENT           // Stock count reconciliation/correction
+  ASSEMBLY_CONSUMED           // Raw component consumed into package assembly
+  ASSEMBLY_PRODUCED           // New pre-assembled package added to assembledStock
+  ORDER_FULFILLED             // Physically handed over to customer
+  ORDER_RESERVATION_RELEASE   // Expired or cancelled order freed stock back to pool
+}
+
+model InventoryTransaction {
+  id              String          @id @default(cuid())
+  type            TransactionType
+  inventoryItemId String?
+  inventoryItem   InventoryItem?  @relation(fields: [inventoryItemId], references: [id])
+  packageId       String?
+  package         Package?        @relation(fields: [packageId], references: [id])
+  quantityDelta   Int             // Negative for consumption/sale, positive for restock/release
+  previousStock   Int?
+  newStock        Int?
+  reason          String?
+  performedById   String?
+  performedBy     User?           @relation(fields: [performedById], references: [id])
+  createdAt       DateTime        @default(now())
+
+  @@map("inventory_transactions")
+}
